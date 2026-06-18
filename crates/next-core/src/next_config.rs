@@ -26,7 +26,7 @@ use turbopack_core::{
     issue::{
         IgnoreIssue, IgnoreIssuePattern, Issue, IssueExt, IssueSeverity, IssueStage, StyledString,
     },
-    module_graph::style_groups::StyleGroupsAlgorithm,
+    module_graph::{chunk_group_info::EntryHeuristics, style_groups::StyleGroupsAlgorithm},
     resolve::ResolveAliasMap,
 };
 use turbopack_ecmascript::{
@@ -1131,6 +1131,87 @@ const DEFAULT_REQUEST_COST: f32 = 20_000.0;
 /// Default `moduleFactorCost` for the graph algorithm.
 const DEFAULT_MODULE_FACTOR_COST: f32 = 1.0;
 
+/// `experimental.chunkingHeuristics`: hints for Turbopack's production chunker.
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Deserialize,
+    TraceRawVcs,
+    NonLocalValue,
+    OperationValue,
+    Encode,
+    Decode,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct ChunkingHeuristicsConfig {
+    /// Groups of pages commonly visited together, each defined by a list of regular expressions
+    /// matched against the route pathname. The cluster ID is the index in this list.
+    clusters: Option<Vec<Vec<RegexComponents>>>,
+    /// A number between `0.0..=1.0`. Higher values weight the benefit of merging
+    /// chunks for a single page load more heavily. A site's bounce rate is a good
+    /// approximation if you don't have a better value.
+    first_page_load_priority: Option<f64>,
+    /// Regular expressions matching routes that are priority routes and should be grouped more
+    /// eagerly to reduce the single-route request cost (e.g. the homepage) at the cost of
+    /// requiring more requests on navigation.
+    priority_routes: Option<Vec<RegexComponents>>,
+    /// Multiplier applied to the single-request probability of `priority_routes` routes
+    /// (default `1.5`). Higher values merge their client-side bundles more eagerly.
+    priority_boost: Option<f64>,
+    /// Estimated cost of an additional request, in bytes (uncompressed and unminified
+    /// bytes of code, default is 200 KB), used by the chunker to trade off request
+    /// count against preventing double-fetching.
+    request_cost: Option<u64>,
+}
+
+#[turbo_tasks::value]
+pub struct ChunkingHeuristics {
+    /// The route-matching regexes for each user-defined cluster.
+    clusters: Vec<Vec<EsRegex>>,
+    /// First-page-load priority as an integer percentage (`0..=100`), or `None` if unset.
+    pub first_page_load_priority: Option<u32>,
+    /// Route-matching regexes for priority routes.
+    priority_routes: Vec<EsRegex>,
+    /// Priority-route boost as an integer percentage (e.g. `150` for a 1.5x boost), or
+    /// `None` to use the default.
+    pub priority_boost_percent: Option<u32>,
+    /// Global estimated cost of an additional request, in bytes, or `None` if unset.
+    pub request_cost: Option<u64>,
+}
+
+impl ChunkingHeuristics {
+    /// Compute the [`EntryHeuristics`] for a route `pathname` by matching it against the configured
+    /// cluster and priority-route regexes.
+    pub fn entry_heuristics_for(&self, pathname: &str) -> EntryHeuristics {
+        let clusters = self
+            .clusters
+            .iter()
+            .enumerate()
+            .filter(|(_, regexes)| regexes.iter().any(|regex| regex.is_match(pathname)))
+            .map(|(index, _)| index as u16)
+            .collect();
+        let priority = self
+            .priority_routes
+            .iter()
+            .any(|regex| regex.is_match(pathname));
+        EntryHeuristics { clusters, priority }
+    }
+}
+
+/// Compile a list of route-matching [`RegexComponents`] into [`EsRegex`]es.
+fn parse_route_regexes(patterns: &[RegexComponents]) -> Result<Vec<EsRegex>> {
+    patterns
+        .iter()
+        .cloned()
+        .map(|pattern| {
+            EsRegex::try_from(pattern)
+                .context("Invalid route pattern in `experimental.turbopackChunkingHeuristics`")
+        })
+        .collect()
+}
+
 /// Resolve `experimental.cssChunking` to the [`StyleGroupsAlgorithm`] Turbopack should use.
 ///
 /// `strict` and `false` (`CssChunkingObject::None`) are bundler-incompatible with Turbopack and
@@ -1222,6 +1303,9 @@ pub struct ExperimentalConfig {
 
     /// CSS chunking strategy. See [`CssChunkingConfig`] for the accepted shapes.
     css_chunking: Option<CssChunkingConfig>,
+
+    /// Traffic-shape hints for the production chunker. See [`ChunkingHeuristicsConfig`].
+    turbopack_chunking_heuristics: Option<ChunkingHeuristicsConfig>,
 
     // ---
     // UNSUPPORTED
@@ -2010,6 +2094,34 @@ impl NextConfig {
     #[turbo_tasks::function]
     pub fn css_chunking(&self) -> Result<Vc<StyleGroupsAlgorithm>> {
         Ok(resolve_css_chunking_algorithm(self.experimental.css_chunking.as_ref())?.cell())
+    }
+
+    #[turbo_tasks::function]
+    pub fn chunking_heuristics(&self) -> Result<Vc<ChunkingHeuristics>> {
+        let config = self.experimental.turbopack_chunking_heuristics.as_ref();
+        let clusters = config
+            .and_then(|c| c.clusters.as_deref())
+            .unwrap_or_default()
+            .iter()
+            .map(|patterns| parse_route_regexes(patterns))
+            .collect::<Result<Vec<_>>>()?;
+        let priority_routes = parse_route_regexes(
+            config
+                .and_then(|c| c.priority_routes.as_deref())
+                .unwrap_or_default(),
+        )?;
+        Ok(ChunkingHeuristics {
+            clusters,
+            first_page_load_priority: config
+                .and_then(|c| c.first_page_load_priority)
+                .map(|priority| (priority.clamp(0.0, 1.0) * 100.0).round() as u32),
+            priority_routes,
+            priority_boost_percent: config
+                .and_then(|c| c.priority_boost)
+                .map(|boost| (boost.max(0.0) * 100.0).round() as u32),
+            request_cost: config.and_then(|c| c.request_cost),
+        }
+        .cell())
     }
 
     #[turbo_tasks::function]

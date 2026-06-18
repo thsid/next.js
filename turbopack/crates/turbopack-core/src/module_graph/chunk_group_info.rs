@@ -94,6 +94,38 @@ pub struct ChunkGroupInfo {
     #[turbo_tasks(trace_ignore)]
     #[bincode(with = "turbo_bincode::indexset")]
     pub chunk_group_keys: FxIndexSet<ChunkGroupKey>,
+    pub chunking_heuristics: ChunkingHeuristicsInfo,
+}
+
+/// Chunking heuristics computed by [`compute_chunk_group_info`]. `clusters` is indexed by
+/// chunk-group index (same length and order as [`ChunkGroupInfo::chunk_groups`]); `priority_routes`
+/// is a set of those indices.
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    TraceRawVcs,
+    ValueDebugFormat,
+    NonLocalValue,
+    Encode,
+    Decode,
+)]
+pub struct ChunkingHeuristicsInfo {
+    /// For each chunk group (by index), the set of cluster IDs it belongs to. A cluster ID is the
+    /// index of a configured cluster. A route's chunk group carries that route's clusters; chunk
+    /// groups it pulls in inherit them.
+    ///
+    /// Example: `clusters[5] = [0, 2]` — chunk group 5 is part of clusters 0 and 2.
+    pub clusters: Vec<Vec<u16>>,
+    /// The set of chunk-group indices that belong to a priority route: the priority
+    /// routes themselves, plus every chunk group they pull in.
+    ///
+    /// Example: `priority_routes = {3, 7}` — chunk groups 3 and 7 are served by a priority
+    /// route; any group not in the set (e.g. 4) is not.
+    #[turbo_tasks(trace_ignore)]
+    pub priority_routes: RoaringBitmapWrapper,
 }
 
 #[turbo_tasks::value_impl]
@@ -126,11 +158,35 @@ impl ChunkGroupInfo {
     }
 }
 
+/// Per-entry chunking heuristics.
+#[turbo_tasks::task_input]
+#[derive(Debug, Default, Clone, Hash, PartialEq, Eq, TraceRawVcs, Encode, Decode)]
+pub struct EntryHeuristics {
+    /// Cluster indices this route belongs to.
+    pub clusters: Vec<u16>,
+    /// Whether this route is marked as a priority route.
+    pub priority: bool,
+}
+
+impl EntryHeuristics {
+    /// Heuristics for an entry that is a priority route: belongs to no clusters and is marked as a
+    /// priority route.
+    pub fn priority() -> Self {
+        Self {
+            clusters: Vec::new(),
+            priority: true,
+        }
+    }
+}
+
 /// See [ChunkGroup] for documentation
 #[turbo_tasks::task_input]
 #[derive(Debug, Clone, Hash, PartialEq, Eq, TraceRawVcs, Encode, Decode)]
 pub enum ChunkGroupEntry {
-    Entry(Vec<ResolvedVc<Box<dyn Module>>>),
+    Entry {
+        modules: Vec<ResolvedVc<Box<dyn Module>>>,
+        heuristics: EntryHeuristics,
+    },
     Async(ResolvedVc<Box<dyn Module>>),
     Isolated(ResolvedVc<Box<dyn Module>>),
     IsolatedMerged {
@@ -152,7 +208,9 @@ impl ChunkGroupEntry {
             Self::Async(e) | Self::Isolated(e) | Self::Shared(e) => {
                 Either::Left(std::iter::once(*e))
             }
-            Self::Entry(entries)
+            Self::Entry {
+                modules: entries, ..
+            }
             | Self::IsolatedMerged { entries, .. }
             | Self::SharedMultiple(entries)
             | Self::SharedMerged { entries, .. } => Either::Right(entries.iter().copied()),
@@ -465,7 +523,7 @@ pub async fn compute_chunk_group_info(graph: &ModuleGraph) -> Result<Vc<ChunkGro
             >,
         ) -> ChunkGroupKey {
             match entry {
-                ChunkGroupEntry::Entry(entries) => ChunkGroupKey::Entry(entries),
+                ChunkGroupEntry::Entry { modules, .. } => ChunkGroupKey::Entry(modules),
                 ChunkGroupEntry::Async(entry) => ChunkGroupKey::Async(entry),
                 ChunkGroupEntry::Isolated(entry) => ChunkGroupKey::Isolated(entry),
                 ChunkGroupEntry::Shared(entry) => ChunkGroupKey::Shared(entry),
@@ -760,6 +818,7 @@ pub async fn compute_chunk_group_info(graph: &ModuleGraph) -> Result<Vc<ChunkGro
         Ok(ChunkGroupInfo {
             module_chunk_groups: ResolvedVc::cell(module_chunk_groups),
             chunk_group_keys: chunk_groups_map.keys().cloned().collect(),
+            chunking_heuristics: ChunkingHeuristicsInfo::default(),
             chunk_groups: chunk_groups_map
                 .into_iter()
                 .map(|(k, (_, merged_entries))| match k {
