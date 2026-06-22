@@ -260,6 +260,18 @@ pub struct ChunkingConfig {
     /// type.
     pub style_groups_algorithm: StyleGroupsAlgorithm,
 
+    /// Bounce rate as an integer percentage (`0..=100`), or `None` to use the default. Used by the
+    /// production chunker's merge heuristics.
+    pub bounce_rate_percent: Option<u32>,
+
+    /// Priority boost as an integer percentage (e.g. `150` for a 1.5x boost), or `None` to use the
+    /// default. Used by the production chunker's merge heuristics.
+    pub priority_boost_percent: Option<u32>,
+
+    /// Estimated request cost in bytes, or `None` to use the default. Used by the production
+    /// chunker's merge heuristics.
+    pub request_cost: Option<u64>,
+
     #[allow(dead_code)]
     pub placeholder_for_future_extensions: (),
 }
