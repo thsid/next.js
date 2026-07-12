@@ -1518,6 +1518,30 @@ async fn default_route_tree(
     })
 }
 
+/// Returns whether this app directory subtree (including all descendants)
+/// contains a real route: a `page`, `route`, `not-found`, or
+/// `global-not-found`. Mirrors the equivalent check used by the webpack/dev
+/// entrypoint resolver so that an `app` directory that merely exists (e.g.
+/// only a `layout.tsx`, left over from an aborted App Router migration)
+/// doesn't cause Turbopack to register an implicit `_not-found`/
+/// `_global-error` route that would shadow a custom `pages/404`.
+async fn directory_tree_has_any_route(directory_tree: Vc<DirectoryTree>) -> Result<bool> {
+    let tree = &*directory_tree.await?;
+    if tree.modules.page.is_some()
+        || tree.modules.route.is_some()
+        || tree.modules.not_found.is_some()
+        || tree.modules.global_not_found.is_some()
+    {
+        return Ok(true);
+    }
+    for &subdirectory in tree.subdirectories.values() {
+        if Box::pin(directory_tree_has_any_route(*subdirectory)).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[turbo_tasks::function]
 async fn directory_tree_to_entrypoints_internal(
     app_dir: FileSystemPath,
@@ -1677,187 +1701,194 @@ async fn directory_tree_to_entrypoints_internal_untraced(
             );
         }
 
-        let mut modules = directory_tree.modules.clone();
+        // An `app` directory that has no real routes anywhere in it shouldn't
+        // get an implicit `_not-found`/`_global-error` route: that would
+        // shadow a custom `pages/404` even though the app dir isn't actually
+        // being used.
+        if directory_tree_has_any_route(directory_tree_vc).await? {
+            let mut modules = directory_tree.modules.clone();
 
-        // fill in the default modules for the not-found entrypoint
-        if modules.layout.is_none() {
-            modules.layout = Some(
-                get_next_package(app_dir.clone())
-                    .await?
-                    .join("dist/client/components/builtin/layout.js")?,
-            );
-        }
+            // fill in the default modules for the not-found entrypoint
+            if modules.layout.is_none() {
+                modules.layout = Some(
+                    get_next_package(app_dir.clone())
+                        .await?
+                        .join("dist/client/components/builtin/layout.js")?,
+                );
+            }
 
-        if modules.not_found.is_none() {
-            modules.not_found = Some(
-                get_next_package(app_dir.clone())
-                    .await?
-                    .join("dist/client/components/builtin/not-found.js")?,
-            );
-        }
-        if modules.forbidden.is_none() {
-            modules.forbidden = Some(
-                get_next_package(app_dir.clone())
-                    .await?
-                    .join("dist/client/components/builtin/forbidden.js")?,
-            );
-        }
-        if modules.unauthorized.is_none() {
-            modules.unauthorized = Some(
-                get_next_package(app_dir.clone())
-                    .await?
-                    .join("dist/client/components/builtin/unauthorized.js")?,
-            );
-        }
-        if modules.global_error.is_none() {
-            modules.global_error = Some(
-                get_next_package(app_dir.clone())
-                    .await?
-                    .join("dist/client/components/builtin/global-error.js")?,
-            );
-        }
+            if modules.not_found.is_none() {
+                modules.not_found = Some(
+                    get_next_package(app_dir.clone())
+                        .await?
+                        .join("dist/client/components/builtin/not-found.js")?,
+                );
+            }
+            if modules.forbidden.is_none() {
+                modules.forbidden = Some(
+                    get_next_package(app_dir.clone())
+                        .await?
+                        .join("dist/client/components/builtin/forbidden.js")?,
+                );
+            }
+            if modules.unauthorized.is_none() {
+                modules.unauthorized = Some(
+                    get_next_package(app_dir.clone())
+                        .await?
+                        .join("dist/client/components/builtin/unauthorized.js")?,
+                );
+            }
+            if modules.global_error.is_none() {
+                modules.global_error = Some(
+                    get_next_package(app_dir.clone())
+                        .await?
+                        .join("dist/client/components/builtin/global-error.js")?,
+                );
+            }
 
-        // Next.js has this logic in "collect-app-paths", where the root not-found page
-        // is considered as its own entry point.
+            // Next.js has this logic in "collect-app-paths", where the root not-found page
+            // is considered as its own entry point.
 
-        // Determine if we enable the global not-found feature.
-        let is_global_not_found_enabled = *is_global_not_found_enabled.await?;
-        let use_global_not_found =
-            is_global_not_found_enabled || modules.global_not_found.is_some();
+            // Determine if we enable the global not-found feature.
+            let is_global_not_found_enabled = *is_global_not_found_enabled.await?;
+            let use_global_not_found =
+                is_global_not_found_enabled || modules.global_not_found.is_some();
 
-        let not_found_root_modules = modules.without_leaves();
-        let not_found_tree = AppPageLoaderTree {
-            page: app_page.clone(),
-            segment: directory_name.clone(),
-            parallel_routes: fxindexmap! {
-                rcstr!("children") => AppPageLoaderTree {
-                    page: app_page.clone(),
-                    segment: rcstr!("/_not-found"),
-                    parallel_routes: fxindexmap! {
-                        rcstr!("children") => AppPageLoaderTree {
-                            page: app_page.clone(),
-                            segment: rcstr!("__PAGE__"),
-                            parallel_routes: FxIndexMap::default(),
-                            modules: if use_global_not_found {
-                                // if global-not-found.js is present:
-                                // leaf module only keeps page pointing to empty-stub
-                                AppDirModules {
-                                    // page is built-in/empty-stub
-                                    page: Some(get_next_package(app_dir.clone())
-                                        .await?
-                                        .join("dist/client/components/builtin/empty-stub.js")?,
-                                    ),
-                                    ..Default::default()
-                                }
-                            } else {
-                                // if global-not-found.js is not present:
-                                // we search if we can compose root layout with the root not-found.js;
-                                AppDirModules {
-                                    page: match modules.not_found {
-                                        Some(v) => Some(v),
-                                        None => Some(get_next_package(app_dir.clone())
-                                            .await?
-                                            .join("dist/client/components/builtin/not-found.js")?,
-                                        ),
-                                    },
-                                    ..Default::default()
-                                }
-                            },
-                            global_metadata,
-                            static_siblings: Vec::new(),
-                        }
-                    },
-                    modules: AppDirModules {
-                        ..Default::default()
-                    },
-                    global_metadata,
-                    static_siblings: Vec::new(),
-                },
-            },
-            modules: AppDirModules {
-                // `global-not-found.js` does not need a layout since it's included.
-                // Skip it if it's present.
-                // Otherwise, we need to compose it with the root layout to compose with
-                // not-found.js boundary.
-                layout: if use_global_not_found {
-                    match modules.global_not_found {
-                        Some(v) => Some(v),
-                        None => Some(
-                            get_next_package(app_dir.clone())
-                                .await?
-                                .join("dist/client/components/builtin/global-not-found.js")?,
-                        ),
-                    }
-                } else {
-                    modules.layout
-                },
-                ..not_found_root_modules
-            },
-            global_metadata,
-            static_siblings: Vec::new(),
-        }
-        .resolved_cell();
-
-        {
-            let app_page = app_page
-                .clone_push_str("_not-found")?
-                .complete(PageType::Page)?;
-
-            add_app_page(
-                app_dir.clone(),
-                &mut result,
-                app_page,
-                not_found_tree,
-                root_params,
-            );
-        }
-
-        // Create production global error page only in build mode
-        // This aligns with webpack: default Pages entries (including /_error) are only added when
-        // the build isn't app-only. If the build is app-only (no user pages/api), we should still
-        // expose the app global error so runtime errors render, but we shouldn't emit it otherwise.
-        if matches!(*next_mode.await?, NextMode::Build) {
-            // Create a `_global-error/page` route using user's global-error.js or built-in
-            // fallback.
-            let next_package = get_next_package(app_dir.clone()).await?;
-            let global_error_tree = AppPageLoaderTree {
+            let not_found_root_modules = modules.without_leaves();
+            let not_found_tree = AppPageLoaderTree {
                 page: app_page.clone(),
                 segment: directory_name.clone(),
                 parallel_routes: fxindexmap! {
                     rcstr!("children") => AppPageLoaderTree {
                         page: app_page.clone(),
-                        segment: rcstr!("__PAGE__"),
-                        parallel_routes: FxIndexMap::default(),
+                        segment: rcstr!("/_not-found"),
+                        parallel_routes: fxindexmap! {
+                            rcstr!("children") => AppPageLoaderTree {
+                                page: app_page.clone(),
+                                segment: rcstr!("__PAGE__"),
+                                parallel_routes: FxIndexMap::default(),
+                                modules: if use_global_not_found {
+                                    // if global-not-found.js is present:
+                                    // leaf module only keeps page pointing to empty-stub
+                                    AppDirModules {
+                                        // page is built-in/empty-stub
+                                        page: Some(get_next_package(app_dir.clone())
+                                            .await?
+                                            .join("dist/client/components/builtin/empty-stub.js")?,
+                                        ),
+                                        ..Default::default()
+                                    }
+                                } else {
+                                    // if global-not-found.js is not present:
+                                    // we search if we can compose root layout with the root not-found.js;
+                                    AppDirModules {
+                                        page: match modules.not_found {
+                                            Some(v) => Some(v),
+                                            None => Some(get_next_package(app_dir.clone())
+                                                .await?
+                                                .join("dist/client/components/builtin/not-found.js")?,
+                                            ),
+                                        },
+                                        ..Default::default()
+                                    }
+                                },
+                                global_metadata,
+                                static_siblings: Vec::new(),
+                            }
+                        },
                         modules: AppDirModules {
-                            page: Some(next_package
-                                .join("dist/client/components/builtin/app-error.js")?),
                             ..Default::default()
                         },
                         global_metadata,
                         static_siblings: Vec::new(),
-                    }
+                    },
                 },
-                // global-error is needed for getGlobalErrorStyles to work during rendering.
-                // Use user's custom global-error if defined, otherwise builtin fallback.
                 modules: AppDirModules {
-                    global_error: modules.global_error.clone(),
-                    ..Default::default()
+                    // `global-not-found.js` does not need a layout since it's included.
+                    // Skip it if it's present.
+                    // Otherwise, we need to compose it with the root layout to compose with
+                    // not-found.js boundary.
+                    layout: if use_global_not_found {
+                        match modules.global_not_found {
+                            Some(v) => Some(v),
+                            None => Some(
+                                get_next_package(app_dir.clone())
+                                    .await?
+                                    .join("dist/client/components/builtin/global-not-found.js")?,
+                            ),
+                        }
+                    } else {
+                        modules.layout
+                    },
+                    ..not_found_root_modules
                 },
                 global_metadata,
                 static_siblings: Vec::new(),
             }
             .resolved_cell();
 
-            let app_global_error_page = app_page
-                .clone_push_str("_global-error")?
-                .complete(PageType::Page)?;
-            add_app_page(
-                app_dir.clone(),
-                &mut result,
-                app_global_error_page,
-                global_error_tree,
-                root_params,
-            );
+            {
+                let app_page = app_page
+                    .clone_push_str("_not-found")?
+                    .complete(PageType::Page)?;
+
+                add_app_page(
+                    app_dir.clone(),
+                    &mut result,
+                    app_page,
+                    not_found_tree,
+                    root_params,
+                );
+            }
+
+            // Create production global error page only in build mode
+            // This aligns with webpack: default Pages entries (including /_error) are only added
+            // when the build isn't app-only. If the build is app-only (no user
+            // pages/api), we should still expose the app global error so runtime errors
+            // render, but we shouldn't emit it otherwise.
+            if matches!(*next_mode.await?, NextMode::Build) {
+                // Create a `_global-error/page` route using user's global-error.js or built-in
+                // fallback.
+                let next_package = get_next_package(app_dir.clone()).await?;
+                let global_error_tree = AppPageLoaderTree {
+                    page: app_page.clone(),
+                    segment: directory_name.clone(),
+                    parallel_routes: fxindexmap! {
+                        rcstr!("children") => AppPageLoaderTree {
+                            page: app_page.clone(),
+                            segment: rcstr!("__PAGE__"),
+                            parallel_routes: FxIndexMap::default(),
+                            modules: AppDirModules {
+                                page: Some(next_package
+                                    .join("dist/client/components/builtin/app-error.js")?),
+                                ..Default::default()
+                            },
+                            global_metadata,
+                            static_siblings: Vec::new(),
+                        }
+                    },
+                    // global-error is needed for getGlobalErrorStyles to work during rendering.
+                    // Use user's custom global-error if defined, otherwise builtin fallback.
+                    modules: AppDirModules {
+                        global_error: modules.global_error.clone(),
+                        ..Default::default()
+                    },
+                    global_metadata,
+                    static_siblings: Vec::new(),
+                }
+                .resolved_cell();
+
+                let app_global_error_page = app_page
+                    .clone_push_str("_global-error")?
+                    .complete(PageType::Page)?;
+                add_app_page(
+                    app_dir.clone(),
+                    &mut result,
+                    app_global_error_page,
+                    global_error_tree,
+                    root_params,
+                );
+            }
         }
     }
 
